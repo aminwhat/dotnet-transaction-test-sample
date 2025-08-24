@@ -1,4 +1,9 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
 
 public class TodoModel
 {
@@ -12,7 +17,7 @@ public class AppDbContext : DbContext
     public DbSet<TodoModel> Todos { get; set; }
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)
-        => options.UseSqlite("Data Source=todos.db");
+        => options.UseSqlite("Data Source=todos_large.db"); // new DB file for large test
 }
 
 class Program
@@ -23,20 +28,22 @@ class Program
         await db.Database.EnsureDeletedAsync();
         await db.Database.EnsureCreatedAsync();
 
-        Console.WriteLine("=== Running Transaction Stress Test ===");
+        Console.WriteLine("=== LARGE TRANSACTION STRESS TEST ===");
 
         var rnd = new Random();
-        int totalTransactions = 100;  // scale this higher for heavy tests
+        int totalTransactions = 1000;  // ⬅️ adjust for even larger load (e.g. 5000)
         int committedCount = 0, rolledBackCount = 0;
+
+        var sw = Stopwatch.StartNew();
 
         for (int i = 0; i < totalTransactions; i++)
         {
             using var transaction = await db.Database.BeginTransactionAsync();
             try
             {
-                // Insert N rows in this transaction
-                int inserts = rnd.Next(1, 10);
-                var items = new List<TodoModel>();
+                // Insert between 50 and 200 rows per transaction
+                int inserts = rnd.Next(50, 200);
+                var items = new List<TodoModel>(inserts);
 
                 for (int j = 0; j < inserts; j++)
                 {
@@ -50,44 +57,48 @@ class Program
                 db.Todos.AddRange(items);
                 await db.SaveChangesAsync();
 
-                // Randomly decide to rollback or commit
-                if (rnd.Next(2) == 0)
+                // Randomly rollback or commit
+                if (rnd.Next(100) < 40) // 40% rollback chance
                 {
-                    Console.WriteLine($"[Tx {i}] Rolling back {inserts} inserts...");
                     await transaction.RollbackAsync();
                     rolledBackCount += inserts;
                 }
                 else
                 {
-                    Console.WriteLine($"[Tx {i}] Committing {inserts} inserts...");
                     await transaction.CommitAsync();
                     committedCount += inserts;
                 }
+
+                // Log progress every 100 transactions
+                if (i % 100 == 0 && i > 0)
+                    Console.WriteLine($"Processed {i}/{totalTransactions} transactions...");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Tx {i}] Exception: {ex.Message}, rolling back...");
+                Console.WriteLine($"[Tx {i}] Error: {ex.Message} → Rolling back...");
                 await transaction.RollbackAsync();
             }
         }
 
+        sw.Stop();
+
         // --- Verification ---
-        Console.WriteLine("\n=== Verification Phase ===");
+        Console.WriteLine("\n=== VERIFICATION ===");
         var dbCount = await db.Todos.CountAsync();
 
-        Console.WriteLine($"Expected committed rows: {committedCount}");
-        Console.WriteLine($"Actual rows in DB:       {dbCount}");
+        Console.WriteLine($"Committed inserts (expected): {committedCount}");
+        Console.WriteLine($"Rolled back inserts (ignored): {rolledBackCount}");
+        Console.WriteLine($"Actual rows in DB:            {dbCount}");
+        Console.WriteLine($"Execution Time: {sw.Elapsed.TotalSeconds:F2}s");
 
         if (dbCount == committedCount)
-            Console.WriteLine("✅ Test Passed: All commits/rollbacks behaved correctly.");
+            Console.WriteLine("✅ Test Passed: Database state matches expectations.");
         else
             Console.WriteLine("❌ Test Failed: Data mismatch!");
 
-        Console.WriteLine("\n--- Sample Data in DB ---");
-        var sample = await db.Todos.AsNoTracking().Take(20).ToListAsync();
+        Console.WriteLine("\n--- Sample of DB Rows ---");
+        var sample = await db.Todos.AsNoTracking().Take(30).ToListAsync();
         foreach (var todo in sample)
-        {
             Console.WriteLine($"{todo.Id}: {todo.Title} (Done: {todo.IsDone})");
-        }
     }
 }
