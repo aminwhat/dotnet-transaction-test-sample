@@ -1,23 +1,19 @@
 ﻿using Microsoft.EntityFrameworkCore;
-using System;
-using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
-using System.Threading.Tasks;
 
-public class TodoModel
+public class UserModel
 {
     public int Id { get; set; }
-    public string Title { get; set; } = string.Empty;
-    public bool IsDone { get; set; }
+    public string Username { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
 }
 
 public class AppDbContext : DbContext
 {
-    public DbSet<TodoModel> Todos { get; set; }
+    public DbSet<UserModel> Users { get; set; }
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)
-        => options.UseSqlite("Data Source=todos_large.db"); // new DB file for large test
+        => options.UseSqlite("Data Source=users_test.db");
 }
 
 class Program
@@ -28,77 +24,87 @@ class Program
         await db.Database.EnsureDeletedAsync();
         await db.Database.EnsureCreatedAsync();
 
-        Console.WriteLine("=== LARGE TRANSACTION STRESS TEST ===");
-
-        var rnd = new Random();
-        int totalTransactions = 1000;  // ⬅️ adjust for even larger load (e.g. 5000)
-        int committedCount = 0, rolledBackCount = 0;
+        Console.WriteLine("=== DUPLICATE INSERT STRESS TEST ===");
 
         var sw = Stopwatch.StartNew();
+        int requestCount = 2000;   // simulate many requests
+        int concurrency = 50;      // parallel threads
 
-        for (int i = 0; i < totalTransactions; i++)
+        var tasks = new List<Task>();
+
+        for (int i = 0; i < concurrency; i++)
         {
-            using var transaction = await db.Database.BeginTransactionAsync();
-            try
+            tasks.Add(Task.Run(async () =>
             {
-                // Insert between 50 and 200 rows per transaction
-                int inserts = rnd.Next(50, 200);
-                var items = new List<TodoModel>(inserts);
+                using var scopedDb = new AppDbContext();
 
-                for (int j = 0; j < inserts; j++)
+                for (int j = 0; j < requestCount / concurrency; j++)
                 {
-                    items.Add(new TodoModel
+                    // simulate a request inserting the SAME USERNAME
+                    using var tx = await scopedDb.Database.BeginTransactionAsync();
+                    try
                     {
-                        Title = $"Tx{i}_Item{j}",
-                        IsDone = rnd.Next(2) == 0
-                    });
-                }
+                        var user = new UserModel
+                        {
+                            Username = "duplicate_test",
+                            CreatedAt = DateTime.UtcNow
+                        };
 
-                db.Todos.AddRange(items);
-                await db.SaveChangesAsync();
+                        scopedDb.Users.Add(user);
+                        await scopedDb.SaveChangesAsync();
 
-                // Randomly rollback or commit
-                if (rnd.Next(100) < 40) // 40% rollback chance
-                {
-                    await transaction.RollbackAsync();
-                    rolledBackCount += inserts;
-                }
-                else
-                {
-                    await transaction.CommitAsync();
-                    committedCount += inserts;
-                }
+                        // Random: sometimes "simulate retry" by inserting again
+                        if (Random.Shared.Next(1000) < 5) // ~0.5% retry chance
+                        {
+                            scopedDb.Users.Add(new UserModel
+                            {
+                                Username = "duplicate_test",
+                                CreatedAt = DateTime.UtcNow
+                            });
+                            await scopedDb.SaveChangesAsync();
+                        }
 
-                // Log progress every 100 transactions
-                if (i % 100 == 0 && i > 0)
-                    Console.WriteLine($"Processed {i}/{totalTransactions} transactions...");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[Tx {i}] Error: {ex.Message} → Rolling back...");
-                await transaction.RollbackAsync();
-            }
+                        await tx.CommitAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[Error] {ex.Message}");
+                        await tx.RollbackAsync();
+                    }
+                }
+            }));
         }
 
+        await Task.WhenAll(tasks);
         sw.Stop();
 
         // --- Verification ---
         Console.WriteLine("\n=== VERIFICATION ===");
-        var dbCount = await db.Todos.CountAsync();
 
-        Console.WriteLine($"Committed inserts (expected): {committedCount}");
-        Console.WriteLine($"Rolled back inserts (ignored): {rolledBackCount}");
-        Console.WriteLine($"Actual rows in DB:            {dbCount}");
-        Console.WriteLine($"Execution Time: {sw.Elapsed.TotalSeconds:F2}s");
+        var grouped = await db.Users
+            .GroupBy(u => u.Username)
+            .Select(g => new { g.Key, Count = g.Count() })
+            .ToListAsync();
 
-        if (dbCount == committedCount)
-            Console.WriteLine("✅ Test Passed: Database state matches expectations.");
+        foreach (var g in grouped)
+        {
+            Console.WriteLine($"{g.Key} → {g.Count} records");
+        }
+
+        var duplicates = grouped.Where(g => g.Count > 1).ToList();
+
+        Console.WriteLine($"\nTotal Users: {await db.Users.CountAsync()}");
+        Console.WriteLine($"Duplicates Found: {duplicates.Count}");
+
+        if (duplicates.Any())
+        {
+            Console.WriteLine("❌ Problem Reproduced: Duplicate rows detected.");
+        }
         else
-            Console.WriteLine("❌ Test Failed: Data mismatch!");
+        {
+            Console.WriteLine("✅ No duplicates — transactions consistent.");
+        }
 
-        Console.WriteLine("\n--- Sample of DB Rows ---");
-        var sample = await db.Todos.AsNoTracking().Take(30).ToListAsync();
-        foreach (var todo in sample)
-            Console.WriteLine($"{todo.Id}: {todo.Title} (Done: {todo.IsDone})");
+        Console.WriteLine($"Execution Time: {sw.Elapsed.TotalSeconds:F2}s");
     }
 }
