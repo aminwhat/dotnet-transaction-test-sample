@@ -1,5 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
-using System.Diagnostics;
+using System;
 
 public class UserModel
 {
@@ -24,87 +24,33 @@ class Program
         await db.Database.EnsureDeletedAsync();
         await db.Database.EnsureCreatedAsync();
 
-        Console.WriteLine("=== DUPLICATE INSERT STRESS TEST ===");
+        Console.WriteLine("=== SINGLE REQUEST DUPLICATE TEST ===");
 
-        var sw = Stopwatch.StartNew();
-        int requestCount = 2000;   // simulate many requests
-        int concurrency = 50;      // parallel threads
-
-        var tasks = new List<Task>();
-
-        for (int i = 0; i < concurrency; i++)
+        using var tx = await db.Database.BeginTransactionAsync();
+        try
         {
-            tasks.Add(Task.Run(async () =>
-            {
-                using var scopedDb = new AppDbContext();
+            var username = "test_user";
+            var user = new UserModel { Username = username, CreatedAt = DateTime.UtcNow };
 
-                for (int j = 0; j < requestCount / concurrency; j++)
-                {
-                    // simulate a request inserting the SAME USERNAME
-                    using var tx = await scopedDb.Database.BeginTransactionAsync();
-                    try
-                    {
-                        var user = new UserModel
-                        {
-                            Username = "duplicate_test",
-                            CreatedAt = DateTime.UtcNow
-                        };
+            db.Users.Add(user);
+            db.SaveChanges();
 
-                        scopedDb.Users.Add(user);
-                        await scopedDb.SaveChangesAsync();
+            // 🔴 simulate accidental duplicate insert
+            var duplicate = new UserModel { Username = username, CreatedAt = DateTime.UtcNow };
+            db.Users.Add(duplicate);
+            await db.SaveChangesAsync();
 
-                        // Random: sometimes "simulate retry" by inserting again
-                        if (Random.Shared.Next(1000) < 5) // ~0.5% retry chance
-                        {
-                            scopedDb.Users.Add(new UserModel
-                            {
-                                Username = "duplicate_test",
-                                CreatedAt = DateTime.UtcNow
-                            });
-                            await scopedDb.SaveChangesAsync();
-                        }
-
-                        await tx.CommitAsync();
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[Error] {ex.Message}");
-                        await tx.RollbackAsync();
-                    }
-                }
-            }));
+            await tx.CommitAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
         }
 
-        await Task.WhenAll(tasks);
-        sw.Stop();
-
-        // --- Verification ---
-        Console.WriteLine("\n=== VERIFICATION ===");
-
-        var grouped = await db.Users
-            .GroupBy(u => u.Username)
-            .Select(g => new { g.Key, Count = g.Count() })
-            .ToListAsync();
-
-        foreach (var g in grouped)
+        Console.WriteLine("\n=== RESULT IN DB ===");
+        foreach (var u in db.Users.AsNoTracking())
         {
-            Console.WriteLine($"{g.Key} → {g.Count} records");
+            Console.WriteLine($"{u.Id}: {u.Username} at {u.CreatedAt:O}");
         }
-
-        var duplicates = grouped.Where(g => g.Count > 1).ToList();
-
-        Console.WriteLine($"\nTotal Users: {await db.Users.CountAsync()}");
-        Console.WriteLine($"Duplicates Found: {duplicates.Count}");
-
-        if (duplicates.Any())
-        {
-            Console.WriteLine("❌ Problem Reproduced: Duplicate rows detected.");
-        }
-        else
-        {
-            Console.WriteLine("✅ No duplicates — transactions consistent.");
-        }
-
-        Console.WriteLine($"Execution Time: {sw.Elapsed.TotalSeconds:F2}s");
     }
 }
